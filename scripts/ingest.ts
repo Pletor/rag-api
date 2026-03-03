@@ -1,31 +1,55 @@
 import { readdir, readFile } from 'fs/promises'
 import { join, resolve } from 'path'
 import { config } from 'dotenv'
-import { chunkMarkdown } from '../lib/chunker'
-import { upsertChunks, resetIndex, getIndexStats } from '../lib/vectorStore'
-import type { ChunkSource, DocumentChunk } from '../lib/types'
+import type { ChunkSource } from '../lib/types'
 
 // Načíst .env z root rag-api/
 config({ path: resolve(__dirname, '..', '.env') })
 
 const BASE_DIR = resolve(__dirname, '..', '..')
+const API_URL = process.env.API_URL || 'https://helmaradmin.vercel.app'
+const API_KEY = process.env.API_SECRET_KEY || ''
 
-async function ingestDirectory(dirPath: string, source: ChunkSource): Promise<DocumentChunk[]> {
-  const files = await readdir(dirPath)
-  const mdFiles = files.filter(f => f.endsWith('.md'))
+interface FilePayload {
+  name: string
+  content: string
+  source: ChunkSource
+}
 
-  console.log(`  Nalezeno ${mdFiles.length} .md souborů v ${dirPath}`)
+async function collectFiles(dirPath: string, source: ChunkSource): Promise<FilePayload[]> {
+  const entries = await readdir(dirPath)
+  const mdFiles = entries.filter(f => f.endsWith('.md'))
 
-  const allChunks: DocumentChunk[] = []
+  console.log(`  Nalezeno ${mdFiles.length} .md souborů`)
 
+  const files: FilePayload[] = []
   for (const fileName of mdFiles) {
     const content = await readFile(join(dirPath, fileName), 'utf-8')
-    const chunks = chunkMarkdown(content, fileName, source)
-    console.log(`    ${fileName} → ${chunks.length} chunků`)
-    allChunks.push(...chunks)
+    files.push({ name: fileName, content, source })
+    console.log(`    ${fileName} (${content.length} znaků)`)
   }
 
-  return allChunks
+  return files
+}
+
+async function sendToApi(files: FilePayload[], reset: boolean) {
+  console.log(`\n📡 Posílám ${files.length} souborů na ${API_URL}/api/ingest...`)
+
+  const response = await fetch(`${API_URL}/api/ingest`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': API_KEY
+    },
+    body: JSON.stringify({ files, reset })
+  })
+
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(`API chyba ${response.status}: ${text}`)
+  }
+
+  return await response.json()
 }
 
 async function main() {
@@ -33,32 +57,37 @@ async function main() {
 
   console.log('=== Helmar RAG Ingest ===\n')
 
-  if (shouldReset) {
-    console.log('Resetuji index...')
-    await resetIndex()
-    console.log('Index resetován.\n')
+  if (!API_KEY) {
+    console.error('Chybí API_SECRET_KEY v .env souboru!')
+    process.exit(1)
   }
 
-  // Knowledge base
-  console.log('📚 Ingestuji Knowledge Base...')
-  const knowledgePath = join(BASE_DIR, '01_Context-Knowledge-Base')
-  const knowledgeChunks = await ingestDirectory(knowledgePath, 'knowledge')
-  const knowledgeCount = await upsertChunks(knowledgeChunks)
-  console.log(`  Uloženo ${knowledgeCount} chunků.\n`)
+  // Načíst soubory
+  console.log('📚 Knowledge Base:')
+  const knowledgeFiles = await collectFiles(
+    join(BASE_DIR, '01_Context-Knowledge-Base'), 'knowledge'
+  )
 
-  // Templates
-  console.log('📝 Ingestuji šablony...')
-  const templatePath = join(BASE_DIR, '02_Daktela-Template-Base')
-  const templateChunks = await ingestDirectory(templatePath, 'template')
-  const templateCount = await upsertChunks(templateChunks)
-  console.log(`  Uloženo ${templateCount} chunků.\n`)
+  console.log('\n📝 Šablony:')
+  const templateFiles = await collectFiles(
+    join(BASE_DIR, '02_Daktela-Template-Base'), 'template'
+  )
 
-  // Statistika
-  const stats = await getIndexStats()
-  console.log('📊 Statistika indexu:')
-  console.log(JSON.stringify(stats, null, 2))
+  const allFiles = [...knowledgeFiles, ...templateFiles]
 
-  console.log(`\n✅ Hotovo! Celkem ${knowledgeCount + templateCount} chunků.`)
+  // Poslat na API (po dávkách — Vercel má limit 4.5MB na request)
+  const BATCH_SIZE = 10
+  let totalIngested = 0
+
+  for (let i = 0; i < allFiles.length; i += BATCH_SIZE) {
+    const batch = allFiles.slice(i, i + BATCH_SIZE)
+    const isFirst = i === 0
+    const result = await sendToApi(batch, isFirst && shouldReset)
+    totalIngested += result.ingested
+    console.log(`  Dávka ${Math.floor(i / BATCH_SIZE) + 1}: ${result.ingested} chunků`)
+  }
+
+  console.log(`\n✅ Hotovo! Celkem ${totalIngested} chunků naimportováno.`)
 }
 
 main().catch(err => {
